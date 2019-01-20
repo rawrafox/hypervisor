@@ -1,0 +1,226 @@
+#!/usr/bin/env ruby
+
+require "hypervisor"
+
+MEMORY_SIZE = 1 << 20 # 1 MB
+
+class DOSKernel
+  class Stop < StandardError
+    attr_reader :return_value
+
+    def initialize(return_value)
+      @return_value = return_value
+
+      super("Exiting DOS")
+    end
+  end
+
+  def initialize(memory, argv)
+    @memory = memory
+    @argv = argv
+    @dta = 0
+
+    @fds = {
+      0 => $stdin,
+      1 => $stdout,
+      2 => $stderr
+    }
+    
+    @next_fd = 2
+    
+    @memory.put_bytes(0x00, [0xcd, 0x20].pack("c*"))
+    @memory.put_bytes(0x50, [0xcd, 0x21, 0xcb].pack("c*"))
+    @memory.put_bytes(0x5C, [0x01, 0x20].pack("c*"))
+    
+    argv = argv.map { |x| " #{x}" }.join('')
+    
+    @memory.put_bytes(0x80, [argv.bytesize, argv, 0x0d].pack("cA*c"))
+  end
+
+  def dispatch(cpu, int)
+    case int
+    when 0x20
+      interrupt_0x20(cpu)
+    when 0x21
+      interrupt_0x21(cpu)
+    else
+      raise "Unknown interrupt: #{int}"
+    end
+  end
+
+  private def allocate_fd
+    @next_fd += 1
+  end
+
+  private def interrupt_0x20(cpu)
+    raise "Unsupported: int 0x20 / #{cpu.ah.to_s(16)}"
+  end
+
+  private def interrupt_0x21(cpu)
+    case cpu.ah
+    when 0x1a # set dta
+      @dta = cpu.dx
+    when 0x30 # version
+      cpu.write_register(Hypervisor::X86_RAX, 0x0700)
+    when 0x3d # open
+      # TODO: Don't ignore OFLAG
+      fd = File.open(read_string(cpu.ds, cpu.dx))
+      dos_fd = allocate_fd
+
+      @fds[dos_fd] = fd
+
+      cpu.ax = dos_fd
+      cpu.cf = 0
+    when 0x3f # read
+      fd = @fds.fetch(cpu.bx)
+      data = fd.read(cpu.cx)
+
+      if data
+        write_segment(cpu.ds, cpu.dx, data)
+
+        cpu.ax = data.bytesize
+        cpu.cf = 0
+      else
+        cpu.ax = 0
+        cpu.cf = 1
+      end
+    when 0x40 # write
+      fd = @fds.fetch(cpu.bx)
+
+      cpu.ax = fd.write(read_segment(cpu.ds, cpu.dx, cpu.cx))
+      cpu.cf = 0
+    when 0x42 # lseek
+      fd = @fds.fetch(cpu.bx)
+
+      fd.seek(cpu.cx << 16 | cpu.dx, cpu.al)
+    when 0x4c # exit
+      raise Stop.new(cpu.al)
+    else
+      raise "Unsupported: int 0x21 / #{cpu.ah.to_s(16)}"
+    end
+  end
+
+  def read_segment(s, x, length)
+    @memory.get_bytes((s << 4) + x, length)
+  end
+
+  def read_string(s, x)
+    @memory.get_string((s << 4) + x)
+  end
+
+  def write_segment(s, x, value)
+    @memory.put_bytes((s << 4) + x, value)
+  end
+end
+
+def cap(cap, ctrl)
+  (ctrl | (cap & 0xffffffff)) & (cap >> 32)
+end
+
+Hypervisor.create
+
+memory = Hypervisor.allocate(MEMORY_SIZE)
+memory.put_bytes(0x100, File.read(ARGV[0]))
+
+kernel = DOSKernel.new(memory, ARGV[1 .. -1])
+
+Hypervisor.map(memory, 0, MEMORY_SIZE, Hypervisor::MEMORY_READ | Hypervisor::MEMORY_WRITE | Hypervisor::MEMORY_EXEC)
+
+cpu = Hypervisor::VCPU.new
+cpu.write_vmcs(Hypervisor::VMX_CAP_PINBASED, cap(Hypervisor.read_capability(Hypervisor::VMX_CAP_PINBASED), 0))
+cpu.write_vmcs(Hypervisor::VMX_CAP_PROCBASED, cap(Hypervisor.read_capability(Hypervisor::VMX_CAP_PROCBASED), Hypervisor::CPU_BASED_HLT | Hypervisor::CPU_BASED_CR8_LOAD | Hypervisor::CPU_BASED_CR8_STORE))
+cpu.write_vmcs(Hypervisor::VMX_CAP_PROCBASED2, cap(Hypervisor.read_capability(Hypervisor::VMX_CAP_PROCBASED2), 0))
+cpu.write_vmcs(Hypervisor::VMX_CAP_ENTRY, cap(Hypervisor.read_capability(Hypervisor::VMX_CAP_ENTRY), 0))
+cpu.write_vmcs(Hypervisor::VMX_CAP_PREEMPTION_TIMER, cap(Hypervisor.read_capability(Hypervisor::VMX_CAP_PREEMPTION_TIMER), 0))
+
+cpu.write_vmcs(Hypervisor::VMCS_CTRL_EXC_BITMAP, 0xffffffff)
+cpu.write_vmcs(Hypervisor::VMCS_CTRL_CR0_MASK, 0x60000000)
+cpu.write_vmcs(Hypervisor::VMCS_CTRL_CR0_SHADOW, 0)
+cpu.write_vmcs(Hypervisor::VMCS_CTRL_CR4_MASK, 0)
+cpu.write_vmcs(Hypervisor::VMCS_CTRL_CR4_SHADOW, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_CS, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_CS_LIMIT, 0xffff)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_CS_AR, 0x9b)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_CS_BASE, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_DS, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_DS_LIMIT, 0xffff)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_DS_AR, 0x93)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_DS_BASE, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_ES, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_ES_LIMIT, 0xffff)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_ES_AR, 0x93)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_ES_BASE, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_FS, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_FS_LIMIT, 0xffff)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_FS_AR, 0x93)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_FS_BASE, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_GS, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_GS_LIMIT, 0xffff)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_GS_AR, 0x93)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_GS_BASE, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_SS, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_SS_LIMIT, 0xffff)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_SS_AR, 0x93)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_SS_BASE, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_LDTR, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_LDTR_LIMIT, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_LDTR_AR, 0x10000)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_LDTR_BASE, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_TR, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_TR_LIMIT, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_TR_AR, 0x83)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_TR_BASE, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_GDTR_LIMIT, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_GDTR_BASE, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_IDTR_LIMIT, 0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_IDTR_BASE, 0)
+
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_CR0, 0x20)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_CR3, 0x0)
+cpu.write_vmcs(Hypervisor::VMCS_GUEST_CR4, 0x2000)
+
+cpu.write_register(Hypervisor::X86_RIP, 0x100)
+cpu.write_register(Hypervisor::X86_RFLAGS, 0x2)
+cpu.write_register(Hypervisor::X86_RSP, 0x0)
+
+return_value = -1
+
+loop do
+  cpu.run
+
+  case cpu.read_vmcs(Hypervisor::VMCS_RO_EXIT_REASON)
+  when Hypervisor::VMX_REASON_EPT_VIOLATION, Hypervisor::VMX_REASON_IRQ
+    next
+  when Hypervisor::VMX_REASON_HLT
+    break
+  when Hypervisor::VMX_REASON_EXC_NMI
+    n = cpu.read_vmcs(Hypervisor::VMCS_RO_IDT_VECTOR_INFO) & 0xff
+
+    begin
+      kernel.dispatch(cpu, n)
+      cpu.write_register(Hypervisor::X86_RIP, cpu.read_register(Hypervisor::X86_RIP) + 2)
+    rescue DOSKernel::Stop => e
+      return_value = e.return_value
+      break
+    end
+  else
+    $stderr.puts("ERROR: #{cpu.read_vmcs(Hypervisor::VMCS_RO_EXIT_REASON)}")
+    break
+  end
+end
+
+cpu.destroy!
+
+Hypervisor.destroy
+
+exit(return_value)
